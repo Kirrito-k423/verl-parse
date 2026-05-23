@@ -51,7 +51,7 @@ The workbook contains:
 - `log1_metrics`: full parsed metrics for log1
 - `log2_metrics`: full parsed metrics for log2
 - `summary`: key metrics only
-- `compare`: step x key-metric percent-diff matrix with color highlighting and chart
+- `compare`: step-level grouped columns for each key metric: `log1`, `log2`, `pct_diff`
 - `compare_detail`: full metric-by-metric comparison
 
 ## Compare Rules
@@ -60,6 +60,12 @@ The workbook contains:
 - `1% ~ 5%`: yellow
 - `> 5%`: red
 - missing or baseline zero: gray
+
+The `compare` sheet chart uses:
+
+- X axis: step number
+- Y axis: percent diff vs baseline
+- Fixed Y range: `-15%` to `+15%`
 
 ## Notes
 

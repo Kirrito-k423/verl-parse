@@ -49,6 +49,7 @@ SUMMARY_METRICS: List[tuple[str, Sequence[str]]] = [
     ("timing_s/logp", ("timing_s/log_prob", "timing_s/logp", "timing_s/ref")),
     ("timing_s/old_log_prob", ("timing_s/old_log_prob",)),
     ("timing_s/update_actor", ("timing_s/update_actor",)),
+    ("timing_s/step", ("timing_s/step",)),
     ("perf/throughput", ("perf/throughput",)),
 ]
 
@@ -354,8 +355,21 @@ def write_summary_sheet(
 def build_compare_matrix_rows(
     log1_steps: Dict[int, Dict[str, float | int]],
     log2_steps: Dict[int, Dict[str, float | int]],
-) -> tuple[List[str], List[List[object]]]:
-    headers = ["step", *[display_name for display_name, _ in SUMMARY_METRICS]]
+) -> tuple[List[str], List[List[object]], List[int], List[List[str]]]:
+    headers = ["step"]
+    pct_diff_columns: List[int] = []
+    status_rows: List[List[str]] = []
+
+    for display_name, _ in SUMMARY_METRICS:
+        headers.extend(
+            [
+                f"{display_name} | log1",
+                f"{display_name} | log2",
+                f"{display_name} | pct_diff",
+            ]
+        )
+        pct_diff_columns.append(len(headers))
+
     rows: List[List[object]] = []
     all_steps = sorted(set(log1_steps) | set(log2_steps))
 
@@ -363,30 +377,41 @@ def build_compare_matrix_rows(
         metrics1 = log1_steps.get(step, {})
         metrics2 = log2_steps.get(step, {})
         row: List[object] = [step]
+        status_row: List[str] = []
+
         for _, aliases in SUMMARY_METRICS:
             _, value1 = resolve_metric(metrics1, aliases)
             _, value2 = resolve_metric(metrics2, aliases)
-            _, pct_diff, _ = compare_values(value1, value2)
-            row.append(pct_diff)
+            _, pct_diff, status = compare_values(value1, value2)
+            row.extend([value1, value2, pct_diff])
+            status_row.append(status)
+
         rows.append(row)
+        status_rows.append(status_row)
 
-    return headers, rows
+    return headers, rows, pct_diff_columns, status_rows
 
 
-def add_compare_chart(ws, header_row: int, data_start_row: int, data_end_row: int) -> None:
+def add_compare_chart(
+    ws,
+    *,
+    header_row: int,
+    data_start_row: int,
+    data_end_row: int,
+    pct_diff_columns: Sequence[int],
+) -> None:
     chart = LineChart()
     chart.title = "Percent Diff Trend by Step"
     chart.x_axis.title = "Step"
     chart.y_axis.title = "Pct diff vs baseline"
     chart.y_axis.number_format = PCT_FORMAT
+    chart.y_axis.scaling.min = -0.15
+    chart.y_axis.scaling.max = 0.15
     chart.height = 12
     chart.width = 24
     chart.style = 2
 
-    categories = Reference(ws, min_col=1, min_row=data_start_row, max_row=data_end_row)
-    chart.set_categories(categories)
-
-    for col in range(2, ws.max_column + 1):
+    for col in pct_diff_columns:
         has_value = any(
             ws.cell(row=row_idx, column=col).value is not None
             for row_idx in range(data_start_row, data_end_row + 1)
@@ -397,6 +422,8 @@ def add_compare_chart(ws, header_row: int, data_start_row: int, data_end_row: in
         chart.add_data(data, titles_from_data=True)
 
     if chart.series:
+        categories = Reference(ws, min_col=1, min_row=data_start_row, max_row=data_end_row)
+        chart.set_categories(categories)
         ws.add_chart(chart, f"A{data_end_row + 3}")
 
 
@@ -405,8 +432,12 @@ def write_compare_matrix_sheet(
     *,
     log1_path: Path,
     log2_path: Path,
+    label1: str,
+    label2: str,
     headers: List[str],
     rows: List[List[object]],
+    pct_diff_columns: Sequence[int],
+    status_rows: Sequence[Sequence[str]],
 ) -> None:
     ws.append(["baseline_log", str(log1_path.resolve())])
     ws.append(["compare_log", str(log2_path.resolve())])
@@ -416,25 +447,35 @@ def write_compare_matrix_sheet(
             "abs(pct_diff)<=1% green; 1%-5% yellow; >5% red; gray means missing/baseline zero",
         ]
     )
+    ws.append(["compare_columns", f"step + ({label1} value, {label2} value, pct_diff) for each key metric"])
     ws.append(headers)
 
-    for cell in ws[4]:
+    for cell in ws[5]:
         apply_header_style(cell, COMPARE_FILL)
 
     for row in rows:
         ws.append(row)
 
-    for row in ws.iter_rows(min_row=5, min_col=2, max_col=ws.max_column):
-        for cell in row:
+    data_start_row = 6
+    for row_offset, row_index in enumerate(range(data_start_row, data_start_row + len(rows))):
+        statuses = status_rows[row_offset]
+        for metric_index, pct_col in enumerate(pct_diff_columns):
+            cell = ws.cell(row=row_index, column=pct_col)
             cell.number_format = PCT_FORMAT
-            fill_pct_cell(cell, cell.value, "ok" if cell.value is not None else "missing_in_both")
+            fill_pct_cell(cell, cell.value, statuses[metric_index])
 
-    ws.freeze_panes = "B5"
+    ws.freeze_panes = "B6"
     ws.auto_filter.ref = ws.dimensions
     auto_fit_columns(ws)
 
     if rows:
-        add_compare_chart(ws, header_row=4, data_start_row=5, data_end_row=4 + len(rows))
+        add_compare_chart(
+            ws,
+            header_row=5,
+            data_start_row=data_start_row,
+            data_end_row=data_start_row + len(rows) - 1,
+            pct_diff_columns=pct_diff_columns,
+        )
 
 
 def write_compare_detail_sheet(
@@ -526,13 +567,19 @@ def build_workbook(
     )
 
     compare_sheet = workbook.create_sheet("compare")
-    compare_headers, compare_matrix_rows = build_compare_matrix_rows(log1_steps, log2_steps)
+    compare_headers, compare_matrix_rows, pct_diff_columns, compare_status_rows = (
+        build_compare_matrix_rows(log1_steps, log2_steps)
+    )
     write_compare_matrix_sheet(
         compare_sheet,
         log1_path=log1_path,
         log2_path=log2_path,
+        label1=label1,
+        label2=label2,
         headers=compare_headers,
         rows=compare_matrix_rows,
+        pct_diff_columns=pct_diff_columns,
+        status_rows=compare_status_rows,
     )
 
     compare_detail_sheet = workbook.create_sheet("compare_detail")
