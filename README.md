@@ -8,10 +8,33 @@ Parse two VERL logs and export step-level metrics to Excel.
 python3 -m pip install openpyxl
 ```
 
+### Windows Setup
+
+If `python` is not available in `PATH`, create a virtual environment with a known
+Python executable:
+
+```powershell
+& 'D:\wecode_build_tools\mingw\bin\python.exe' -m venv .venv
+```
+
+Install dependencies with the local proxy:
+
+```powershell
+$env:HTTP_PROXY='http://proxysg.huawei.com:8080'
+$env:HTTPS_PROXY='http://proxysg.huawei.com:8080'
+& '.\.venv\bin\python.exe' -m pip install --upgrade pip openpyxl
+```
+
 ## Usage
 
 ```bash
 python3 parse_verl_logs_to_excel.py log1.log log2.log -o result.xlsx
+```
+
+On Windows with the virtual environment above:
+
+```powershell
+& '.\.venv\bin\python.exe' .\parse_verl_logs_to_excel.py .\log1.log .\log2.log -o .\result.xlsx
 ```
 
 Optional labels:
