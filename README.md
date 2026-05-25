@@ -48,11 +48,20 @@ python3 parse_verl_logs_to_excel.py log1.log log2.log -o result.xlsx \
 
 The workbook contains:
 
+- `metadata`: log source paths, labels, and compare rules
 - `log1_metrics`: full parsed metrics for log1
 - `log2_metrics`: full parsed metrics for log2
 - `summary`: key metrics only
-- `compare`: step-level grouped columns for each key metric: `log1`, `log2`, `pct_diff`
+- `compare`: step-level grouped columns for each key metric
 - `compare_detail`: full metric-by-metric comparison
+
+In `compare`:
+
+- normal metrics include `log1`, `log2`, `pct_diff`
+- performance metrics (`timing_s/*`, `perf/*`) also include `log1/log2` and `log2/log1`
+- one overview chart shows percent diff by step
+- one trend chart per key metric shows `log1` and `log2` curves over steps
+- metric trend charts are placed directly below their corresponding metric columns
 
 ## Compare Rules
 

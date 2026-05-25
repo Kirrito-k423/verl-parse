@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 from openpyxl import Workbook
 from openpyxl.chart import LineChart, Reference
+from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, TwoCellAnchor
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -29,6 +30,7 @@ YELLOW_FILL = PatternFill(fill_type="solid", fgColor="FFEB9C")
 RED_FILL = PatternFill(fill_type="solid", fgColor="FFC7CE")
 GRAY_FILL = PatternFill(fill_type="solid", fgColor="D9D9D9")
 PCT_FORMAT = "0.00%"
+RATIO_FORMAT = '0.00"x"'
 
 SUMMARY_METRICS: List[tuple[str, Sequence[str]]] = [
     ("critic/rewards/mean", ("critic/rewards/mean",)),
@@ -208,6 +210,21 @@ def compare_values(
     return diff, pct_diff, status
 
 
+def compute_ratio(
+    numerator: Optional[float | int],
+    denominator: Optional[float | int],
+) -> Optional[float]:
+    if numerator is None or denominator is None:
+        return None
+    if float(denominator) == 0.0:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def is_performance_metric(metric_name: str) -> bool:
+    return metric_name.startswith("timing_s/") or metric_name.startswith("perf/")
+
+
 def fill_pct_cell(cell, pct_diff: Optional[float], status: str) -> None:
     if status not in {"ok", "baseline_zero"} or pct_diff is None:
         cell.fill = GRAY_FILL
@@ -227,12 +244,10 @@ def write_log_sheet(
     *,
     step_map: Dict[int, Dict[str, float | int]],
     metric_keys: List[str],
-    source_path: Path,
 ) -> None:
-    ws.append(["source_file", str(source_path.resolve())])
     ws.append(["step", *metric_keys])
 
-    for cell in ws[2]:
+    for cell in ws[1]:
         apply_header_style(cell, HEADER_FILL)
 
     for step, metrics in step_map.items():
@@ -240,7 +255,7 @@ def write_log_sheet(
         row.extend(metrics.get(metric) for metric in metric_keys)
         ws.append(row)
 
-    ws.freeze_panes = "B3"
+    ws.freeze_panes = "B2"
     ws.auto_filter.ref = ws.dimensions
     auto_fit_columns(ws)
 
@@ -303,20 +318,10 @@ def build_summary_rows(
 def write_summary_sheet(
     ws,
     *,
-    log1_path: Path,
-    log2_path: Path,
     label1: str,
     label2: str,
     rows: List[List[object]],
 ) -> None:
-    ws.append(["baseline_log", str(log1_path.resolve())])
-    ws.append(["compare_log", str(log2_path.resolve())])
-    ws.append(
-        [
-            "color_rule",
-            "abs(pct_diff)<=1% green; 1%-5% yellow; >5% red; gray means missing/baseline zero",
-        ]
-    )
     headers = [
         "step",
         "focus_metric",
@@ -330,24 +335,24 @@ def write_summary_sheet(
     ]
     ws.append(headers)
 
-    for cell in ws[4]:
+    for cell in ws[1]:
         apply_header_style(cell, COMPARE_FILL)
 
     for row in rows:
         ws.append(row)
 
-    for row in ws.iter_rows(min_row=5, min_col=8, max_col=8):
+    for row in ws.iter_rows(min_row=2, min_col=8, max_col=8):
         cell = row[0]
         cell.number_format = PCT_FORMAT
         status = ws.cell(row=cell.row, column=9).value
         fill_pct_cell(cell, cell.value, status)
 
-    for row in ws.iter_rows(min_row=5, min_col=9, max_col=9):
+    for row in ws.iter_rows(min_row=2, min_col=9, max_col=9):
         cell = row[0]
         if cell.value != "ok":
             cell.fill = MISSING_FILL
 
-    ws.freeze_panes = "B5"
+    ws.freeze_panes = "B2"
     ws.auto_filter.ref = ws.dimensions
     auto_fit_columns(ws)
 
@@ -355,12 +360,22 @@ def write_summary_sheet(
 def build_compare_matrix_rows(
     log1_steps: Dict[int, Dict[str, float | int]],
     log2_steps: Dict[int, Dict[str, float | int]],
-) -> tuple[List[str], List[List[object]], List[int], List[List[str]]]:
+) -> tuple[List[str], List[List[object]], List[Dict[str, object]], List[List[str]]]:
     headers = ["step"]
-    pct_diff_columns: List[int] = []
+    metric_layouts: List[Dict[str, object]] = []
     status_rows: List[List[str]] = []
 
     for display_name, _ in SUMMARY_METRICS:
+        start_col = len(headers) + 1
+        layout: Dict[str, object] = {
+            "name": display_name,
+            "is_performance": is_performance_metric(display_name),
+            "log1_col": start_col,
+            "log2_col": start_col + 1,
+            "pct_col": start_col + 2,
+            "ratio12_col": None,
+            "ratio21_col": None,
+        }
         headers.extend(
             [
                 f"{display_name} | log1",
@@ -368,7 +383,16 @@ def build_compare_matrix_rows(
                 f"{display_name} | pct_diff",
             ]
         )
-        pct_diff_columns.append(len(headers))
+        if layout["is_performance"]:
+            headers.extend(
+                [
+                    f"{display_name} | log1/log2",
+                    f"{display_name} | log2/log1",
+                ]
+            )
+            layout["ratio12_col"] = start_col + 3
+            layout["ratio21_col"] = start_col + 4
+        metric_layouts.append(layout)
 
     rows: List[List[object]] = []
     all_steps = sorted(set(log1_steps) | set(log2_steps))
@@ -379,17 +403,20 @@ def build_compare_matrix_rows(
         row: List[object] = [step]
         status_row: List[str] = []
 
-        for _, aliases in SUMMARY_METRICS:
+        for metric_index, (_, aliases) in enumerate(SUMMARY_METRICS):
+            layout = metric_layouts[metric_index]
             _, value1 = resolve_metric(metrics1, aliases)
             _, value2 = resolve_metric(metrics2, aliases)
             _, pct_diff, status = compare_values(value1, value2)
             row.extend([value1, value2, pct_diff])
+            if layout["is_performance"]:
+                row.extend([compute_ratio(value1, value2), compute_ratio(value2, value1)])
             status_row.append(status)
 
         rows.append(row)
         status_rows.append(status_row)
 
-    return headers, rows, pct_diff_columns, status_rows
+    return headers, rows, metric_layouts, status_rows
 
 
 def add_compare_chart(
@@ -398,7 +425,8 @@ def add_compare_chart(
     header_row: int,
     data_start_row: int,
     data_end_row: int,
-    pct_diff_columns: Sequence[int],
+    metric_layouts: Sequence[Dict[str, object]],
+    anchor_row: int,
 ) -> None:
     chart = LineChart()
     chart.title = "Percent Diff Trend by Step"
@@ -411,7 +439,8 @@ def add_compare_chart(
     chart.width = 24
     chart.style = 2
 
-    for col in pct_diff_columns:
+    for layout in metric_layouts:
+        col = int(layout["pct_col"])
         has_value = any(
             ws.cell(row=row_idx, column=col).value is not None
             for row_idx in range(data_start_row, data_end_row + 1)
@@ -424,71 +453,139 @@ def add_compare_chart(
     if chart.series:
         categories = Reference(ws, min_col=1, min_row=data_start_row, max_row=data_end_row)
         chart.set_categories(categories)
-        ws.add_chart(chart, f"A{data_end_row + 3}")
+        ws.add_chart(chart, f"A{anchor_row}")
+
+
+def anchor_chart_to_cells(
+    chart,
+    *,
+    start_col: int,
+    start_row: int,
+    end_col: int,
+    end_row: int,
+) -> None:
+    chart.anchor = TwoCellAnchor(
+        _from=AnchorMarker(col=start_col - 1, row=start_row - 1),
+        to=AnchorMarker(col=end_col - 1, row=end_row - 1),
+    )
+
+
+def add_metric_trend_charts(
+    ws,
+    *,
+    header_row: int,
+    data_start_row: int,
+    data_end_row: int,
+    metric_layouts: Sequence[Dict[str, object]],
+    start_row: int,
+) -> None:
+    for layout in metric_layouts:
+        log1_col = int(layout["log1_col"])
+        log2_col = int(layout["log2_col"])
+        has_value = any(
+            ws.cell(row=row_idx, column=log1_col).value is not None
+            or ws.cell(row=row_idx, column=log2_col).value is not None
+            for row_idx in range(data_start_row, data_end_row + 1)
+        )
+        if not has_value:
+            continue
+
+        chart = LineChart()
+        chart.title = f"{layout['name']} Trend"
+        chart.x_axis.title = "Step"
+        chart.y_axis.title = "Value"
+        chart.style = 10
+
+        categories = Reference(ws, min_col=1, min_row=data_start_row, max_row=data_end_row)
+        chart.set_categories(categories)
+
+        for series_col in (log1_col, log2_col):
+            data = Reference(
+                ws,
+                min_col=series_col,
+                max_col=series_col,
+                min_row=header_row,
+                max_row=data_end_row,
+            )
+            chart.add_data(data, titles_from_data=True)
+
+        group_end_col = int(layout["ratio21_col"] or layout["pct_col"])
+        chart_width_cols = max(group_end_col - log1_col + 1, 3)
+        chart_end_col = log1_col + chart_width_cols - 1
+        chart_end_row = start_row + 15
+        anchor_chart_to_cells(
+            chart,
+            start_col=log1_col,
+            start_row=start_row,
+            end_col=chart_end_col,
+            end_row=chart_end_row,
+        )
+        ws.add_chart(chart)
 
 
 def write_compare_matrix_sheet(
     ws,
     *,
-    log1_path: Path,
-    log2_path: Path,
     label1: str,
     label2: str,
     headers: List[str],
     rows: List[List[object]],
-    pct_diff_columns: Sequence[int],
+    metric_layouts: Sequence[Dict[str, object]],
     status_rows: Sequence[Sequence[str]],
 ) -> None:
-    ws.append(["baseline_log", str(log1_path.resolve())])
-    ws.append(["compare_log", str(log2_path.resolve())])
-    ws.append(
-        [
-            "color_rule",
-            "abs(pct_diff)<=1% green; 1%-5% yellow; >5% red; gray means missing/baseline zero",
-        ]
-    )
-    ws.append(["compare_columns", f"step + ({label1} value, {label2} value, pct_diff) for each key metric"])
     ws.append(headers)
 
-    for cell in ws[5]:
+    for cell in ws[1]:
         apply_header_style(cell, COMPARE_FILL)
 
     for row in rows:
         ws.append(row)
 
-    data_start_row = 6
+    data_start_row = 2
     for row_offset, row_index in enumerate(range(data_start_row, data_start_row + len(rows))):
         statuses = status_rows[row_offset]
-        for metric_index, pct_col in enumerate(pct_diff_columns):
+        for metric_index, layout in enumerate(metric_layouts):
+            pct_col = int(layout["pct_col"])
             cell = ws.cell(row=row_index, column=pct_col)
             cell.number_format = PCT_FORMAT
             fill_pct_cell(cell, cell.value, statuses[metric_index])
+            for ratio_key in ("ratio12_col", "ratio21_col"):
+                ratio_col = layout[ratio_key]
+                if ratio_col is None:
+                    continue
+                ws.cell(row=row_index, column=int(ratio_col)).number_format = RATIO_FORMAT
 
-    ws.freeze_panes = "B6"
+    ws.freeze_panes = "B2"
     ws.auto_filter.ref = ws.dimensions
     auto_fit_columns(ws)
 
     if rows:
+        trend_start_row = data_start_row + len(rows) + 3
         add_compare_chart(
             ws,
-            header_row=5,
+            header_row=1,
             data_start_row=data_start_row,
             data_end_row=data_start_row + len(rows) - 1,
-            pct_diff_columns=pct_diff_columns,
+            metric_layouts=metric_layouts,
+            anchor_row=trend_start_row + 18,
+        )
+        add_metric_trend_charts(
+            ws,
+            header_row=1,
+            data_start_row=data_start_row,
+            data_end_row=data_start_row + len(rows) - 1,
+            metric_layouts=metric_layouts,
+            start_row=trend_start_row,
         )
 
 
 def write_compare_detail_sheet(
     ws,
     *,
-    log1_path: Path,
-    log2_path: Path,
     label1: str,
     label2: str,
     rows: List[List[object]],
 ) -> None:
-    ws.append(["baseline_log", str(log1_path.resolve())])
-    ws.append(["compare_log", str(log2_path.resolve())])
     headers = [
         "step",
         "metric",
@@ -500,24 +597,54 @@ def write_compare_detail_sheet(
     ]
     ws.append(headers)
 
-    for cell in ws[3]:
+    for cell in ws[1]:
         apply_header_style(cell, COMPARE_FILL)
 
     for row in rows:
         ws.append(row)
 
-    for row in ws.iter_rows(min_row=4, min_col=6, max_col=6):
+    for row in ws.iter_rows(min_row=2, min_col=6, max_col=6):
         cell = row[0]
         cell.number_format = PCT_FORMAT
         status = ws.cell(row=cell.row, column=7).value
         fill_pct_cell(cell, cell.value, status)
 
-    for row in ws.iter_rows(min_row=4, min_col=7, max_col=7):
+    for row in ws.iter_rows(min_row=2, min_col=7, max_col=7):
         cell = row[0]
         if cell.value != "ok":
             cell.fill = MISSING_FILL
 
-    ws.freeze_panes = "B4"
+    ws.freeze_panes = "B2"
+    ws.auto_filter.ref = ws.dimensions
+    auto_fit_columns(ws)
+
+
+def write_metadata_sheet(
+    ws,
+    *,
+    log1_path: Path,
+    log2_path: Path,
+    label1: str,
+    label2: str,
+) -> None:
+    ws.append(["field", "value"])
+    for cell in ws[1]:
+        apply_header_style(cell, HEADER_FILL)
+
+    rows = [
+        ("baseline_log", str(log1_path.resolve())),
+        ("compare_log", str(log2_path.resolve())),
+        ("label1", label1),
+        ("label2", label2),
+        ("compare_color_rule", "abs(pct_diff)<=1% green; 1%-5% yellow; >5% red; gray means missing/baseline zero"),
+        ("performance_ratio_rule", "timing_s/* and perf/* metrics include log1/log2 and log2/log1 ratio columns"),
+        ("compare_trend_chart_rule", "compare sheet includes one pct_diff overview chart and per-metric log1/log2 trend charts"),
+    ]
+
+    for key, value in rows:
+        ws.append([key, value])
+
+    ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
     auto_fit_columns(ws)
 
@@ -544,7 +671,6 @@ def build_workbook(
         log1_sheet,
         step_map=log1_steps,
         metric_keys=all_metric_keys,
-        source_path=log1_path,
     )
 
     log2_sheet = workbook.create_sheet(safe_sheet_title(f"{label2}_metrics"))
@@ -552,33 +678,28 @@ def build_workbook(
         log2_sheet,
         step_map=log2_steps,
         metric_keys=all_metric_keys,
-        source_path=log2_path,
     )
 
     summary_sheet = workbook.create_sheet("summary")
     summary_rows = build_summary_rows(log1_steps, log2_steps)
     write_summary_sheet(
         summary_sheet,
-        log1_path=log1_path,
-        log2_path=log2_path,
         label1=label1,
         label2=label2,
         rows=summary_rows,
     )
 
     compare_sheet = workbook.create_sheet("compare")
-    compare_headers, compare_matrix_rows, pct_diff_columns, compare_status_rows = (
+    compare_headers, compare_matrix_rows, compare_metric_layouts, compare_status_rows = (
         build_compare_matrix_rows(log1_steps, log2_steps)
     )
     write_compare_matrix_sheet(
         compare_sheet,
-        log1_path=log1_path,
-        log2_path=log2_path,
         label1=label1,
         label2=label2,
         headers=compare_headers,
         rows=compare_matrix_rows,
-        pct_diff_columns=pct_diff_columns,
+        metric_layouts=compare_metric_layouts,
         status_rows=compare_status_rows,
     )
 
@@ -586,11 +707,18 @@ def build_workbook(
     compare_rows = build_compare_rows(log1_steps, log2_steps, all_metric_keys)
     write_compare_detail_sheet(
         compare_detail_sheet,
+        label1=label1,
+        label2=label2,
+        rows=compare_rows,
+    )
+
+    metadata_sheet = workbook.create_sheet("metadata")
+    write_metadata_sheet(
+        metadata_sheet,
         log1_path=log1_path,
         log2_path=log2_path,
         label1=label1,
         label2=label2,
-        rows=compare_rows,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
