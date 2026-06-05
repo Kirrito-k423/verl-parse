@@ -30,7 +30,6 @@ YELLOW_FILL = PatternFill(fill_type="solid", fgColor="FFEB9C")
 RED_FILL = PatternFill(fill_type="solid", fgColor="FFC7CE")
 GRAY_FILL = PatternFill(fill_type="solid", fgColor="D9D9D9")
 PCT_FORMAT = "0.00%"
-RATIO_FORMAT = '0.00"x"'
 
 SUMMARY_METRICS: List[tuple[str, Sequence[str]]] = [
     ("critic/rewards/mean", ("critic/rewards/mean",)),
@@ -55,6 +54,13 @@ SUMMARY_METRICS: List[tuple[str, Sequence[str]]] = [
     ("perf/throughput", ("perf/throughput",)),
 ]
 
+STABILITY_WINDOWS: List[tuple[str, int, int]] = [
+    ("avg_step_2_5", 2, 5),
+    ("avg_step_6_10", 6, 10),
+    ("avg_step_11_15", 11, 15),
+    ("avg_step_16_20", 16, 20),
+    ("avg_step_21_30", 21, 30),
+]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -210,19 +216,10 @@ def compare_values(
     return diff, pct_diff, status
 
 
-def compute_ratio(
-    numerator: Optional[float | int],
-    denominator: Optional[float | int],
-) -> Optional[float]:
-    if numerator is None or denominator is None:
+def mean(values: Sequence[float]) -> Optional[float]:
+    if not values:
         return None
-    if float(denominator) == 0.0:
-        return None
-    return float(numerator) / float(denominator)
-
-
-def is_performance_metric(metric_name: str) -> bool:
-    return metric_name.startswith("timing_s/") or metric_name.startswith("perf/")
+    return sum(values) / len(values)
 
 
 def fill_pct_cell(cell, pct_diff: Optional[float], status: str) -> None:
@@ -369,12 +366,9 @@ def build_compare_matrix_rows(
         start_col = len(headers) + 1
         layout: Dict[str, object] = {
             "name": display_name,
-            "is_performance": is_performance_metric(display_name),
             "log1_col": start_col,
             "log2_col": start_col + 1,
             "pct_col": start_col + 2,
-            "ratio12_col": None,
-            "ratio21_col": None,
         }
         headers.extend(
             [
@@ -383,15 +377,6 @@ def build_compare_matrix_rows(
                 f"{display_name} | pct_diff",
             ]
         )
-        if layout["is_performance"]:
-            headers.extend(
-                [
-                    f"{display_name} | log1/log2",
-                    f"{display_name} | log2/log1",
-                ]
-            )
-            layout["ratio12_col"] = start_col + 3
-            layout["ratio21_col"] = start_col + 4
         metric_layouts.append(layout)
 
     rows: List[List[object]] = []
@@ -409,8 +394,6 @@ def build_compare_matrix_rows(
             _, value2 = resolve_metric(metrics2, aliases)
             _, pct_diff, status = compare_values(value1, value2)
             row.extend([value1, value2, pct_diff])
-            if layout["is_performance"]:
-                row.extend([compute_ratio(value1, value2), compute_ratio(value2, value1)])
             status_row.append(status)
 
         rows.append(row)
@@ -509,7 +492,7 @@ def add_metric_trend_charts(
             )
             chart.add_data(data, titles_from_data=True)
 
-        group_end_col = int(layout["ratio21_col"] or layout["pct_col"])
+        group_end_col = int(layout["pct_col"])
         chart_width_cols = max(group_end_col - log1_col + 1, 3)
         chart_end_col = log1_col + chart_width_cols - 1
         chart_end_row = start_row + 15
@@ -549,11 +532,6 @@ def write_compare_matrix_sheet(
             cell = ws.cell(row=row_index, column=pct_col)
             cell.number_format = PCT_FORMAT
             fill_pct_cell(cell, cell.value, statuses[metric_index])
-            for ratio_key in ("ratio12_col", "ratio21_col"):
-                ratio_col = layout[ratio_key]
-                if ratio_col is None:
-                    continue
-                ws.cell(row=row_index, column=int(ratio_col)).number_format = RATIO_FORMAT
 
     ws.freeze_panes = "B2"
     ws.auto_filter.ref = ws.dimensions
@@ -577,6 +555,8 @@ def write_compare_matrix_sheet(
             metric_layouts=metric_layouts,
             start_row=trend_start_row,
         )
+
+    auto_fit_columns(ws)
 
 
 def write_compare_detail_sheet(
@@ -637,7 +617,6 @@ def write_metadata_sheet(
         ("label1", label1),
         ("label2", label2),
         ("compare_color_rule", "abs(pct_diff)<=1% green; 1%-5% yellow; >5% red; gray means missing/baseline zero"),
-        ("performance_ratio_rule", "timing_s/* and perf/* metrics include log1/log2 and log2/log1 ratio columns"),
         ("compare_trend_chart_rule", "compare sheet includes one pct_diff overview chart and per-metric log1/log2 trend charts"),
     ]
 
